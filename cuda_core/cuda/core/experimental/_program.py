@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, Union
 from warnings import warn
 
 if TYPE_CHECKING:
@@ -20,11 +21,85 @@ from cuda.core.experimental._utils.cuda_utils import (
     _handle_boolean_option,
     check_or_create_options,
     driver,
+    get_binding_version,
     handle_return,
     is_nested_sequence,
     is_sequence,
     nvrtc,
 )
+
+
+@contextmanager
+def _nvvm_exception_manager(self):
+    """
+    Taken from _linker.py
+    """
+    try:
+        yield
+    except Exception as e:
+        error_log = ""
+        if hasattr(self, "_mnff"):
+            try:
+                nvvm = _get_nvvm_module()
+                logsize = nvvm.get_program_log_size(self._mnff.handle)
+                if logsize > 1:
+                    log = bytearray(logsize)
+                    nvvm.get_program_log(self._mnff.handle, log)
+                    error_log = log.decode("utf-8", errors="backslashreplace")
+            except Exception:
+                error_log = ""
+        # Starting Python 3.11 we could also use Exception.add_note() for the same purpose, but
+        # unfortunately we are still supporting Python 3.9/3.10...
+        e.args = (e.args[0] + (f"\nNVVM program log: {error_log}" if error_log else ""), *e.args[1:])
+        raise e
+
+
+_nvvm_module = None
+_nvvm_import_attempted = False
+
+
+def _get_nvvm_module():
+    """
+    Handles the import of NVVM module with version and availability checks.
+    NVVM bindings were added in cuda-bindings 12.9.0, so we need to handle cases where:
+    1. cuda.bindings is not new enough (< 12.9.0)
+    2. libnvvm is not found in the Python environment
+
+    Returns:
+        The nvvm module if available and working
+
+    Raises:
+        RuntimeError: If NVVM is not available due to version or library issues
+    """
+    global _nvvm_module, _nvvm_import_attempted
+
+    if _nvvm_import_attempted:
+        if _nvvm_module is None:
+            raise RuntimeError("NVVM module is not available (previous import attempt failed)")
+        return _nvvm_module
+
+    _nvvm_import_attempted = True
+
+    try:
+        version = get_binding_version()
+        if version < (12, 9):
+            raise RuntimeError(
+                f"NVVM bindings require cuda-bindings >= 12.9.0, but found {version[0]}.{version[1]}.x. "
+                "Please update cuda-bindings to use NVVM features."
+            )
+
+        from cuda.bindings import nvvm
+        from cuda.bindings._internal.nvvm import _inspect_function_pointer
+
+        if _inspect_function_pointer("__nvvmCreateProgram") == 0:
+            raise RuntimeError("NVVM library (libnvvm) is not available in this Python environment. ")
+
+        _nvvm_module = nvvm
+        return _nvvm_module
+
+    except RuntimeError as e:
+        _nvvm_module = None
+        raise e
 
 
 def _process_define_macro_inner(formatted_options, macro):
@@ -33,14 +108,14 @@ def _process_define_macro_inner(formatted_options, macro):
         return True
     if isinstance(macro, tuple):
         if len(macro) != 2 or any(not isinstance(val, str) for val in macro):
-            raise RuntimeError(f"Expected define_macro Tuple[str, str], got {macro}")
+            raise RuntimeError(f"Expected define_macro tuple[str, str], got {macro}")
         formatted_options.append(f"--define-macro={macro[0]}={macro[1]}")
         return True
     return False
 
 
 def _process_define_macro(formatted_options, macro):
-    union_type = "Union[str, Tuple[str, str]]"
+    union_type = "Union[str, tuple[str, str]]"
     if _process_define_macro_inner(formatted_options, macro):
         return
     if is_nested_sequence(macro):
@@ -48,7 +123,7 @@ def _process_define_macro(formatted_options, macro):
             if not _process_define_macro_inner(formatted_options, seq_macro):
                 raise RuntimeError(f"Expected define_macro {union_type}, got {seq_macro}")
         return
-    raise RuntimeError(f"Expected define_macro {union_type}, List[{union_type}], got {macro}")
+    raise RuntimeError(f"Expected define_macro {union_type}, list[{union_type}], got {macro}")
 
 
 @dataclass
@@ -79,7 +154,7 @@ class ProgramOptions:
         Enable device code optimization. When specified along with ‘-G’, enables limited debug information generation
         for optimized device code.
         Default: None
-    ptxas_options : Union[str, List[str]], optional
+    ptxas_options : Union[str, list[str]], optional
         Specify one or more options directly to ptxas, the PTX optimizing assembler. Options should be strings.
         For example ["-v", "-O2"].
         Default: None
@@ -113,17 +188,17 @@ class ProgramOptions:
     gen_opt_lto : bool, optional
         Run the optimizer passes before generating the LTO IR.
         Default: False
-    define_macro : Union[str, Tuple[str, str], List[Union[str, Tuple[str, str]]]], optional
+    define_macro : Union[str, tuple[str, str], list[Union[str, tuple[str, str]]]], optional
         Predefine a macro. Can be either a string, in which case that macro will be set to 1, a 2 element tuple of
         strings, in which case the first element is defined as the second, or a list of strings or tuples.
         Default: None
-    undefine_macro : Union[str, List[str]], optional
+    undefine_macro : Union[str, list[str]], optional
         Cancel any previous definition of a macro, or list of macros.
         Default: None
-    include_path : Union[str, List[str]], optional
+    include_path : Union[str, list[str]], optional
         Add the directory or directories to the list of directories to be searched for headers.
         Default: None
-    pre_include : Union[str, List[str]], optional
+    pre_include : Union[str, list[str]], optional
         Preinclude one or more headers during preprocessing. Can be either a string or a list of strings.
         Default: None
     no_source_include : bool, optional
@@ -156,13 +231,13 @@ class ProgramOptions:
     no_display_error_number : bool, optional
         Disable the display of a diagnostic number for warning messages.
         Default: False
-    diag_error : Union[int, List[int]], optional
+    diag_error : Union[int, list[int]], optional
         Emit error for a specified diagnostic message number or comma separated list of numbers.
         Default: None
-    diag_suppress : Union[int, List[int]], optional
+    diag_suppress : Union[int, list[int]], optional
         Suppress a specified diagnostic message number or comma separated list of numbers.
         Default: None
-    diag_warn : Union[int, List[int]], optional
+    diag_warn : Union[int, list[int]], optional
         Emit warning for a specified diagnostic message number or comma separated lis of numbers.
         Default: None
     brief_diagnostics : bool, optional
@@ -189,7 +264,7 @@ class ProgramOptions:
     debug: bool | None = None
     lineinfo: bool | None = None
     device_code_optimize: bool | None = None
-    ptxas_options: Union[str, List[str], Tuple[str]] | None = None
+    ptxas_options: Union[str, list[str], tuple[str]] | None = None
     max_register_count: int | None = None
     ftz: bool | None = None
     prec_sqrt: bool | None = None
@@ -200,11 +275,11 @@ class ProgramOptions:
     link_time_optimization: bool | None = None
     gen_opt_lto: bool | None = None
     define_macro: (
-        Union[str, Tuple[str, str], List[Union[str, Tuple[str, str]]], Tuple[Union[str, Tuple[str, str]]]] | None
+        Union[str, tuple[str, str], list[Union[str, tuple[str, str]]], tuple[Union[str, tuple[str, str]]]] | None
     ) = None
-    undefine_macro: Union[str, List[str], Tuple[str]] | None = None
-    include_path: Union[str, List[str], Tuple[str]] | None = None
-    pre_include: Union[str, List[str], Tuple[str]] | None = None
+    undefine_macro: Union[str, list[str], tuple[str]] | None = None
+    include_path: Union[str, list[str], tuple[str]] | None = None
+    pre_include: Union[str, list[str], tuple[str]] | None = None
     no_source_include: bool | None = None
     std: str | None = None
     builtin_move_forward: bool | None = None
@@ -215,9 +290,9 @@ class ProgramOptions:
     device_int128: bool | None = None
     optimization_info: str | None = None
     no_display_error_number: bool | None = None
-    diag_error: Union[int, List[int], Tuple[int]] | None = None
-    diag_suppress: Union[int, List[int], Tuple[int]] | None = None
-    diag_warn: Union[int, List[int], Tuple[int]] | None = None
+    diag_error: Union[int, list[int], tuple[int]] | None = None
+    diag_suppress: Union[int, list[int], tuple[int]] | None = None
+    diag_warn: Union[int, list[int], tuple[int]] | None = None
     brief_diagnostics: bool | None = None
     time: str | None = None
     split_compile: int | None = None
@@ -229,11 +304,10 @@ class ProgramOptions:
 
         self._formatted_options = []
         if self.arch is not None:
-            self._formatted_options.append(f"--gpu-architecture={self.arch}")
+            self._formatted_options.append(f"-arch={self.arch}")
         else:
-            self._formatted_options.append(
-                "--gpu-architecture=sm_" + "".join(f"{i}" for i in Device().compute_capability)
-            )
+            self.arch = f"sm_{Device().arch}"
+            self._formatted_options.append(f"-arch={self.arch}")
         if self.relocatable_device_code is not None:
             self._formatted_options.append(
                 f"--relocatable-device-code={_handle_boolean_option(self.relocatable_device_code)}"
@@ -370,28 +444,33 @@ class Program:
     code : Any
         String of the CUDA Runtime Compilation program.
     code_type : Any
-        String of the code type. Currently ``"ptx"`` and ``"c++"`` are supported.
+        String of the code type. Currently ``"ptx"``, ``"c++"``, and ``"nvvm"`` are supported.
     options : ProgramOptions, optional
         A ProgramOptions object to customize the compilation process.
         See :obj:`ProgramOptions` for more information.
     """
 
     class _MembersNeededForFinalize:
-        __slots__ = "handle"
+        __slots__ = "handle", "backend"
 
-        def __init__(self, program_obj, handle):
+        def __init__(self, program_obj, handle, backend):
             self.handle = handle
+            self.backend = backend
             weakref.finalize(program_obj, self.close)
 
         def close(self):
             if self.handle is not None:
-                handle_return(nvrtc.nvrtcDestroyProgram(self.handle))
+                if self.backend == "NVRTC":
+                    handle_return(nvrtc.nvrtcDestroyProgram(self.handle))
+                elif self.backend == "NVVM":
+                    nvvm = _get_nvvm_module()
+                    nvvm.destroy_program(self.handle)
                 self.handle = None
 
     __slots__ = ("__weakref__", "_mnff", "_backend", "_linker", "_options")
 
     def __init__(self, code, code_type, options: ProgramOptions = None):
-        self._mnff = Program._MembersNeededForFinalize(self, None)
+        self._mnff = Program._MembersNeededForFinalize(self, None, None)
 
         self._options = options = check_or_create_options(ProgramOptions, options, "Program options")
         code_type = code_type.lower()
@@ -402,6 +481,7 @@ class Program:
             # TODO: allow tuples once NVIDIA/cuda-python#72 is resolved
 
             self._mnff.handle = handle_return(nvrtc.nvrtcCreateProgram(code.encode(), options._name, 0, [], []))
+            self._mnff.backend = "NVRTC"
             self._backend = "NVRTC"
             self._linker = None
 
@@ -411,8 +491,22 @@ class Program:
                 ObjectCode._init(code.encode(), code_type), options=self._translate_program_options(options)
             )
             self._backend = self._linker.backend
+
+        elif code_type == "nvvm":
+            if isinstance(code, str):
+                code = code.encode("utf-8")
+            elif not isinstance(code, (bytes, bytearray)):
+                raise TypeError("NVVM IR code must be provided as str, bytes, or bytearray")
+
+            nvvm = _get_nvvm_module()
+            self._mnff.handle = nvvm.create_program()
+            self._mnff.backend = "NVVM"
+            nvvm.add_module_to_program(self._mnff.handle, code, len(code), options._name.decode())
+            self._backend = "NVVM"
+            self._linker = None
+
         else:
-            supported_code_types = ("c++", "ptx")
+            supported_code_types = ("c++", "ptx", "nvvm")
             assert code_type not in supported_code_types, f"{code_type=}"
             raise RuntimeError(f"Unsupported {code_type=} ({supported_code_types=})")
 
@@ -432,6 +526,33 @@ class Program:
             split_compile=options.split_compile,
             ptxas_options=options.ptxas_options,
         )
+
+    def _translate_program_options_to_nvvm(self, options: ProgramOptions) -> list[str]:
+        """Translate ProgramOptions to NVVM-specific compilation options."""
+        nvvm_options = []
+
+        assert options.arch is not None
+        arch = options.arch
+        if arch.startswith("sm_"):
+            arch = f"compute_{arch[3:]}"
+        nvvm_options.append(f"-arch={arch}")
+        if options.debug:
+            nvvm_options.append("-g")
+        if options.device_code_optimize is False:
+            nvvm_options.append("-opt=0")
+        elif options.device_code_optimize is True:
+            nvvm_options.append("-opt=3")
+        # NVVM is not consistent with NVRTC, it uses 0/1 instead...
+        if options.ftz is not None:
+            nvvm_options.append(f"-ftz={'1' if options.ftz else '0'}")
+        if options.prec_sqrt is not None:
+            nvvm_options.append(f"-prec-sqrt={'1' if options.prec_sqrt else '0'}")
+        if options.prec_div is not None:
+            nvvm_options.append(f"-prec-div={'1' if options.prec_div else '0'}")
+        if options.fma is not None:
+            nvvm_options.append(f"-fma={'1' if options.fma else '0'}")
+
+        return nvvm_options
 
     def close(self):
         """Destroy this program."""
@@ -453,7 +574,7 @@ class Program:
         target_type : Any
             String of the targeted compilation type.
             Supported options are "ptx", "cubin" and "ltoir".
-        name_expressions : Union[List, Tuple], optional
+        name_expressions : Union[list, tuple], optional
             List of explicit name expressions to become accessible.
             (Default to no expressions)
         logs : Any, optional
@@ -512,6 +633,31 @@ class Program:
                     logs.write(log.decode("utf-8", errors="backslashreplace"))
 
             return ObjectCode._init(data, target_type, symbol_mapping=symbol_mapping, name=self._options.name)
+
+        elif self._backend == "NVVM":
+            if target_type not in ("ptx", "ltoir"):
+                raise ValueError(f'NVVM backend only supports target_type="ptx", "ltoir", got "{target_type}"')
+
+            nvvm_options = self._translate_program_options_to_nvvm(self._options)
+            if target_type == "ltoir" and "-gen-lto" not in nvvm_options:
+                nvvm_options.append("-gen-lto")
+            nvvm = _get_nvvm_module()
+            with _nvvm_exception_manager(self):
+                nvvm.verify_program(self._mnff.handle, len(nvvm_options), nvvm_options)
+                nvvm.compile_program(self._mnff.handle, len(nvvm_options), nvvm_options)
+
+            size = nvvm.get_compiled_result_size(self._mnff.handle)
+            data = bytearray(size)
+            nvvm.get_compiled_result(self._mnff.handle, data)
+
+            if logs is not None:
+                logsize = nvvm.get_program_log_size(self._mnff.handle)
+                if logsize > 1:
+                    log = bytearray(logsize)
+                    nvvm.get_program_log(self._mnff.handle, log)
+                    logs.write(log.decode("utf-8", errors="backslashreplace"))
+
+            return ObjectCode._init(data, target_type, name=self._options.name)
 
         supported_backends = ("nvJitLink", "driver")
         if self._backend not in supported_backends:
